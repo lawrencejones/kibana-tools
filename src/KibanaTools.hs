@@ -25,6 +25,7 @@ type ScrollIdentifier = String
 data MainOptions = MainOptions
    { optKibanaHost :: KibanaHost
    , optQueryFile :: String
+   , optPerPage :: Int
    }
 
 instance Options.Options MainOptions where
@@ -33,6 +34,7 @@ instance Options.Options MainOptions where
             "Target kibana host"
         <*> simpleOption "query-file" "/tmp/query.json"
             "File containing JSON query"
+        <*> simpleOption "per-page" 1000 "Paginate by N results"
 
 main :: IO ()
 main = runCommand $ \opts args -> do
@@ -41,26 +43,27 @@ main = runCommand $ \opts args -> do
 
 runMain opts "query" = do
     queryContents <- B.readFile (optQueryFile opts)
-    results <- queryKibanaCommand (optKibanaHost opts) (fromJust.decode $ queryContents :: KibanaQuery)
+    let query = fromJust.decode $ queryContents :: KibanaQuery
+    results <- queryKibanaCommand (optKibanaHost opts) (optPerPage opts) query
     C.putStrLn $ encodePretty results
 
-queryKibanaCommand :: KibanaHost -> KibanaQuery -> IO [Value]
-queryKibanaCommand host query = do
-    response <- postWith opts url (toJSON query)
-    paginateQuery (makeScroller host (getId response)) (getHits response)
+queryKibanaCommand :: KibanaHost -> Int -> KibanaQuery -> IO [Value]
+queryKibanaCommand host perPage query = do
+    initialPage <- postWith opts url (toJSON query)
+    paginate (makeScroller host (getId initialPage)) [] initialPage
+
     where
-      opts    = defaults & param "size" .~ ["10000"] & param "scroll" .~ ["1m"]
+      opts    = defaults & param "size" .~ [T.pack (show perPage)] & param "scroll" .~ ["1m"]
       url     = host ++ "/_search"
       getId   = (^.. responseBody . key "_scroll_id")
       getHits = (^.. responseBody . key "hits" . key "hits")
 
-      paginateQuery scroller results = do
+      paginate scroller results page = do
         hPutStrLn stderr "Paginating..."
-        page <- scroller
         case getHits page of
           [Array rs]
             | Vector.null rs -> return results
-            | otherwise      -> paginateQuery scroller (results ++ Vector.toList rs)
+            | otherwise      -> scroller >>= paginate scroller (results ++ Vector.toList rs)
 
 makeScroller :: KibanaHost -> [Value] -> IO (Response B.ByteString)
 makeScroller host [String id] = post url body
