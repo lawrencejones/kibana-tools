@@ -4,6 +4,7 @@ import System.Environment
 import System.IO
 import Options
 import Data.Maybe
+import Control.Monad (liftM,ap)
 import qualified Data.Vector as Vector (null,(++),toList)
 import GHC.Exts (toList)
 import qualified Data.Text as T
@@ -15,8 +16,6 @@ import Data.Aeson
 import Data.Aeson.Encode.Pretty (encodePretty)
 import Data.Aeson.Lens (key, nth)
 import Data.Aeson.Types
-import Data.Map
-import qualified Data.Map as Map
 
 type KibanaHost = String
 type KibanaQuery = Value
@@ -49,24 +48,27 @@ runMain opts "query" = do
 
 queryKibanaCommand :: KibanaHost -> Int -> KibanaQuery -> IO [Value]
 queryKibanaCommand host perPage query = do
-    initialPage <- postWith opts url (toJSON query)
-    paginate (makeScroller host (getId initialPage)) [] initialPage
+    page    <- postWith opts url query
+    results <- paginate $ scroller host (getId page)
+
+    return $ foldl (++) (getResults page) results
 
     where
-      opts    = defaults & param "size" .~ [T.pack (show perPage)] & param "scroll" .~ ["1m"]
       url     = host ++ "/_search"
+      opts    = defaults & param "size" .~ [T.pack (show perPage)] & param "scroll" .~ ["1m"]
       getId   = (^.. responseBody . key "_scroll_id")
       getHits = (^.. responseBody . key "hits" . key "hits")
 
-      paginate scroller results page = do
-        hPutStrLn stderr "Paginating..."
-        case getHits page of
-          [Array rs]
-            | Vector.null rs -> return results
-            | otherwise      -> scroller >>= paginate scroller (results ++ Vector.toList rs)
+      paginate :: IO (Response B.ByteString) -> IO [[Value]]
+      paginate = liftM (takeWhile (not . null) . repeat . getResults)
 
-makeScroller :: KibanaHost -> [Value] -> IO (Response B.ByteString)
-makeScroller host [String id] = post url body
+      getResults    = unwrapHits . getHits
+      unwrapHits hs = case hs of [Array hs'] -> Vector.toList hs'
+
+scroller :: KibanaHost -> [Value] -> IO (Response B.ByteString)
+scroller host [String id] = do
+    hPutStrLn stderr "Scrolling..."
+    post url body
     where
       url  = host ++ "/_search/scroll"
       body = object ["scroll" .= ("1m" :: T.Text), "scroll_id" .= id]
