@@ -1,12 +1,13 @@
 {-# LANGUAGE OverloadedStrings #-}
 
-import System.Environment
-import System.IO
+import System.Environment ()
+import System.IO (stderr, hPutStrLn)
 import Options
 import Data.Maybe
-import Control.Monad (liftM,ap)
-import qualified Data.Vector as Vector (null,(++),toList)
-import GHC.Exts (toList)
+import Control.Monad
+import Control.Monad.Loops
+import Debug.Trace
+import qualified Data.Vector as Vector (toList)
 import qualified Data.Text as T
 import qualified Data.ByteString.Lazy as B
 import qualified Data.ByteString.Lazy.Char8 as C (putStrLn)
@@ -14,12 +15,10 @@ import Network.Wreq
 import Control.Lens hiding ((.=))
 import Data.Aeson
 import Data.Aeson.Encode.Pretty (encodePretty)
-import Data.Aeson.Lens (key, nth)
-import Data.Aeson.Types
+import Data.Aeson.Lens (key)
 
 type KibanaHost = String
 type KibanaQuery = Value
-type ScrollIdentifier = String
 
 data MainOptions = MainOptions
    { optKibanaHost :: KibanaHost
@@ -49,9 +48,11 @@ runMain opts "query" = do
 queryKibanaCommand :: KibanaHost -> Int -> KibanaQuery -> IO [Value]
 queryKibanaCommand host perPage query = do
     page    <- postWith opts url query
-    results <- paginate $ scroller host (getId page)
+    results <- unfoldM (getResultsM (scroller host (getId page)))
 
-    return $ foldl (++) (getResults page) results
+    return $ case getResults page of
+      Just rs -> concat (rs : results)
+      Nothing -> []
 
     where
       url     = host ++ "/_search"
@@ -59,16 +60,21 @@ queryKibanaCommand host perPage query = do
       getId   = (^.. responseBody . key "_scroll_id")
       getHits = (^.. responseBody . key "hits" . key "hits")
 
-      paginate :: IO (Response B.ByteString) -> IO [[Value]]
-      paginate = liftM (takeWhile (not . null) . repeat . getResults)
+      getResultsM :: IO (Response B.ByteString) -> IO (Maybe [Value])
+      getResultsM = fmap getResults
 
-      getResults    = unwrapHits . getHits
+      getResults :: Response B.ByteString -> Maybe [Value]
+      getResults page =
+        case unwrapHits (getHits page) of
+          [] -> Nothing
+          hs -> Just hs
+
       unwrapHits hs = case hs of [Array hs'] -> Vector.toList hs'
 
 scroller :: KibanaHost -> [Value] -> IO (Response B.ByteString)
-scroller host [String id] = do
+scroller host [String sid] = do
     hPutStrLn stderr "Scrolling..."
     post url body
     where
       url  = host ++ "/_search/scroll"
-      body = object ["scroll" .= ("1m" :: T.Text), "scroll_id" .= id]
+      body = object ["scroll" .= ("1m" :: T.Text), "scroll_id" .= sid]
